@@ -21,7 +21,7 @@ OMICRON_PARAMS = {
 
     "tau1": np.array([1/6, 1/6, 1/6], dtype=float),
 
-    "delta1": np.array([0.0, 0.0, 0.0], dtype=float),
+    "delta1": np.array([0.0, 0.0, 0.0], dtype=float),  #I decided to not have any deaths but I was too lazy to remove delta.
 
     "tau2": np.array([0.152, 0.124, 0.091], dtype=float),
 
@@ -94,7 +94,7 @@ def SEIHDR_model(
 
     # force of infection
     infectious_fraction = np.divide(
-        infected + hospitalized,
+        infected + 0.1* hospitalized,  #assume hospitzlied are less infectious
         population,
         out=np.zeros_like(infected, dtype=float),
         where=population > 0,

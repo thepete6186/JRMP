@@ -1,5 +1,6 @@
 # This script aggregates the original 15x15 age-contact matrix into 3 main age groups.
 import numpy as np
+import shutil
 
 original_matrix = np.array([
     [3.11, 0.51, 0.14, 0.07, 0.67, 0.86, 1.58, 0.85, 0.71, 0.21, 0.34, 0.50, 0.46, 0.13, 0.05],
