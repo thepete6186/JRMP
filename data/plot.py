@@ -21,8 +21,8 @@ def main(argv=None):
         start_date = '2020-11-15'
         end_date = '2021-05-15'
     elif args.wave == '5':
-        start_date = '2022-01-01'
-        end_date = '2022-06-01'
+        start_date = '2022-02-01'
+        end_date = '2022-05-01'
     else:
         # Fall back to whatever was provided in --start and --end
         start_date = args.start

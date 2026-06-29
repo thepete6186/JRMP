@@ -121,12 +121,12 @@ def main(argv=None):
 
     if args.wave == '4':
         start_date = '2020-11-15'
-        end_date = '2021-05-15'
+        end_date = '2021-05-15'   
         model_params = ANCESTRAL_PARAMS
         wave_title = "Wave 4 (Ancestral)"
     else:
         start_date = '2022-01-01'
-        end_date = '2022-06-01'
+        end_date = '2022-06-01'   #I have no clue when omicron starts
         model_params = OMICRON_PARAMS
         wave_title = "Wave 5 (Omicron)"
 
