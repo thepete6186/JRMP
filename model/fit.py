@@ -1,95 +1,51 @@
 import argparse
 import sys
+from pathlib import Path
+
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
-from pathlib import Path
-import shutil
-import time
+from scipy.interpolate import make_interp_spline
 
-# Import everything from your files
-from SEIHDR import run_model, ANCESTRAL_PARAMS, OMICRON_PARAMS, DEFAULT_POPULATION
 
+# ==============================================================================
+# 1. FIX PATH MANIPULATION BEFORE ANY CUSTOM IMPORTS
+# ==============================================================================
 current_file = Path(__file__).resolve()
 root_dir = current_file.parent.parent
 if str(root_dir) not in sys.path:
     sys.path.append(str(root_dir))
 
+
+from SEIHDR import run_model, ANCESTRAL_PARAMS, OMICRON_PARAMS, DEFAULT_POPULATION
 from data.plot import load_hkgov_critical_series
 
 
-def objective_function(params_to_fit, t, observed_critical, static_params, wave):
-    """
-    Calculates the sum of squared errors between the model's total 
-    critical cases and the observed data. Dynamically reconstructs 
-    y0 based on the optimizer's current seed percentage guess.
-    """
-    # Unpack the parameters the optimizer is tweaking
-    beta = params_to_fit[0]
-    seed_percentage = params_to_fit[1]
-    
-    # Reconstruct y0 dynamically inside the optimization loop
-    y0_matrix = np.zeros((3, 6))
-    for i in range(3):
-        init_exposed = 0.0
-        init_infected = 0.0
-        init_hospitalized = 0.0
+# ==============================================================================
+# CONFIG
+# ==============================================================================
+WEIGHTED_START = np.datetime64("2022-01-01")
+WEIGHTED_END = np.datetime64("2022-02-01")
+WEIGHT_MULTIPLIER = 0.3
 
-        if wave == '5':
-            # Seed the middle age group (Index 1) dynamically using the optimizer's guess
-            if i == 1:
-                init_exposed = DEFAULT_POPULATION[i] * seed_percentage
-                init_infected = DEFAULT_POPULATION[i] * seed_percentage
-            # Keep other age cohorts clean at t=0
-            elif i == 2 or i == 0:
-                init_exposed = 0.0
-                init_infected = 0.0
-        else:
-            # Seed Wave 4 across groups using the dynamic seed parameter
-            if i == 1: # Middle age gets the core seed guess
-                init_exposed = DEFAULT_POPULATION[i] * seed_percentage
-                init_infected = DEFAULT_POPULATION[i] * seed_percentage
-            elif i == 2 or i == 0: # Others get a much smaller fraction of it
-                init_exposed = DEFAULT_POPULATION[i] * (seed_percentage * 0.1)
-                init_infected = DEFAULT_POPULATION[i] * (seed_percentage * 0.1)
-        
-        y0_matrix[i, 1] = init_exposed
-        y0_matrix[i, 2] = init_infected
-        y0_matrix[i, 3] = init_hospitalized
-        y0_matrix[i, 4] = 0.0
-        y0_matrix[i, 5] = 0.0
-        y0_matrix[i, 0] = DEFAULT_POPULATION[i] - np.sum(y0_matrix[i, 1:])
-        
-    y0 = y0_matrix.reshape(-1)
-    
-    # Run the ODE solver
-    y_hat = run_model(y0, t, beta, static_params)
-    state_reshaped = y_hat.reshape(len(t), 3, 6)
-    model_total_critical = np.sum(state_reshaped[:, :, 3], axis=1)
-    
-    return np.sum((observed_critical - model_total_critical) ** 2)
+BETA_MIN = 0.2
+BETA_MAX = 1.2  # Tightened upper bound to prevent explosive wave 4 growth
+BETA_ROUGHNESS_WEIGHT = 5000.0  # Slightly increased to support smoothing
+BETA_BOUNDARY_PENALTY = 1e5
+
+SEED_BOUNDS = (1e-6, 0.02)
+CONSTANT_BETA_BOUNDS = (0.05, 2.5)
+SPLINE_BETA_BOUNDS = (0.1, 1.2)  # Tightened spline search space upper bound
 
 
-def archive_old_fitted_plots(plots_dir, pattern="fitting_wave_*.png"):
-    """
-    Sweeps through the directory and safely moves matching older plots into 
-    the archive directory, appending a unique execution timestamp.
-    """
-    old_dir = plots_dir / "old"
-    old_dir.mkdir(parents=True, exist_ok=True)
-
-    for old_plot in plots_dir.glob(pattern):
-        if old_plot.is_file():
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            archived_name = f"{old_plot.stem}_{timestamp}{old_plot.suffix}"
-            shutil.move(str(old_plot), str(old_dir / archived_name))
+def get_knot_times(t, n_knots=3):  # Restricted exclusively to 3 knots
+    return np.linspace(0, len(t) - 1, n_knots, dtype=int)
 
 
 def build_y0(seed_percentage, wave):
-    """Helper function to cleanly reconstruct y0 for plotting after fitting."""
     y0_matrix = np.zeros((3, 6))
     for i in range(3):
-        if wave == '5':
+        if wave == "5":
             if i == 1:
                 init_exposed = DEFAULT_POPULATION[i] * seed_percentage
                 init_infected = DEFAULT_POPULATION[i] * seed_percentage
@@ -103,101 +59,215 @@ def build_y0(seed_percentage, wave):
             else:
                 init_exposed = DEFAULT_POPULATION[i] * (seed_percentage * 0.1)
                 init_infected = DEFAULT_POPULATION[i] * (seed_percentage * 0.1)
-                
+
         y0_matrix[i, 1] = init_exposed
         y0_matrix[i, 2] = init_infected
         y0_matrix[i, 3] = 0.0
         y0_matrix[i, 4] = 0.0
         y0_matrix[i, 5] = 0.0
         y0_matrix[i, 0] = DEFAULT_POPULATION[i] - np.sum(y0_matrix[i, 1:])
+
     return y0_matrix.reshape(-1)
 
 
+def build_weights(dates, wave):
+    weights = np.ones(len(dates), dtype=float)
+    if wave == "5":
+        mask = (dates >= WEIGHTED_START) & (dates < WEIGHTED_END)
+        weights[mask] = WEIGHT_MULTIPLIER
+    return weights
+
+
+def objective_function(
+    params_to_fit,
+    t,
+    observed_critical,
+    static_params,
+    wave,
+    use_splines=False,
+    knot_times=None,
+    weights=None,
+):
+    seed_percentage = params_to_fit[0]
+
+    if use_splines and knot_times is not None:
+        beta_knots = params_to_fit[1:]
+        # Changed degree k=3 (cubic) to k=2 (quadratic spline)
+        beta_func = make_interp_spline(knot_times, beta_knots, k=2)
+        beta_eval = beta_func(t)
+
+        # Penalize the entire evaluated timeline array instead of just sparse knots
+        boundary_penalty = 0.0
+        boundary_penalty += max(0.0, BETA_MIN - np.min(beta_eval)) ** 2
+        boundary_penalty += max(0.0, np.max(beta_eval) - BETA_MAX) ** 2
+        boundary_penalty *= BETA_BOUNDARY_PENALTY
+    else:
+        beta = params_to_fit[1] if len(params_to_fit) > 1 else params_to_fit[0]
+        beta_eval = beta
+
+        boundary_penalty = 0.0
+        boundary_penalty += max(0.0, BETA_MIN - beta) ** 2
+        boundary_penalty += max(0.0, beta - BETA_MAX) ** 2
+        boundary_penalty *= BETA_BOUNDARY_PENALTY
+
+    y0 = build_y0(seed_percentage, wave)
+    y_hat = run_model(y0, t, beta_eval, static_params)
+    state_reshaped = y_hat.reshape(len(t), 3, 6)
+    model_total_critical = np.sum(state_reshaped[:, :, 3], axis=1)
+
+    resid = observed_critical - model_total_critical
+
+    if weights is None:
+        loss = np.sum(resid ** 2)
+    else:
+        loss = np.sum(weights * resid ** 2)
+
+    if use_splines:
+        roughness = np.sum(np.diff(beta_knots, n=2) ** 2)
+        loss += BETA_ROUGHNESS_WEIGHT * roughness
+
+    return loss + boundary_penalty
+
+
+def fit_with_multistart(
+    t,
+    observed_critical,
+    model_params,
+    wave,
+    use_splines,
+    knot_times,
+    weights,
+):
+    seed_grid = np.logspace(np.log10(SEED_BOUNDS[0]), np.log10(SEED_BOUNDS[1]), 10)
+
+    if use_splines:
+        base_beta = 0.6
+        # Initializing parameters specifically for 3 knots (1 seed parameter + 3 beta knots)
+        x0_list = [[seed0] + [base_beta] * 3 for seed0 in seed_grid]
+        bounds = [SEED_BOUNDS] + [SPLINE_BETA_BOUNDS] * 3
+    else:
+        x0_list = [[seed0, 0.5] for seed0 in seed_grid]
+        bounds = [SEED_BOUNDS, CONSTANT_BETA_BOUNDS]
+
+    best_result = None
+
+    for x0 in x0_list:
+        result = minimize(
+            objective_function,
+            x0,
+            args=(t, observed_critical, model_params, wave, use_splines, knot_times, weights),
+            method="L-BFGS-B",
+            bounds=bounds,
+            options={"maxiter": 500, "ftol": 1e-9}
+        )
+
+        if best_result is None or result.fun < best_result.fun:
+            best_result = result
+
+    return best_result
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='Parameter fitting with dynamic initial conditions.')
-    parser.add_argument('--how', choices=['least_squares'], default='least_squares', help='Which fitting method to use')
-    parser.add_argument('--wave', choices=['4', '5'], default='4', help='Wave to fit: 4 (Ancestral) or 5 (Omicron)')
+    parser = argparse.ArgumentParser(description="Parameter fitting with weighted wave 5 data.")
+    parser.add_argument("--how", choices=["least_squares"], default="least_squares")
+    parser.add_argument("--wave", choices=["4", "5"], default="4")
+    parser.add_argument("--splines", choices=["y", "n"], default="n")
     args = parser.parse_args(argv)
 
-    if args.wave == '4':
-        start_date = '2020-11-15'
-        end_date = '2021-05-15'   
+    if args.wave == "4":
+        end_date = "2021-05-15"
         model_params = ANCESTRAL_PARAMS
         wave_title = "Wave 4 (Ancestral)"
+        start_dates = ["2020-10-15", "2020-11-01", "2020-11-15", "2020-12-01"]
     else:
-        start_date = '2022-01-01'
-        end_date = '2022-06-01'   #I have no clue when omicron starts
+        end_date = "2022-06-01"
         model_params = OMICRON_PARAMS
         wave_title = "Wave 5 (Omicron)"
+        start_dates = ["2022-01-01", "2022-01-15", "2022-02-01", "2022-02-15"]
 
-    print(f"Loading HK Gov data for {wave_title}...")
-    dates, observed_critical = load_hkgov_critical_series(start_date=start_date, end_date=end_date)
-    t = np.arange(len(dates))
-    
-    if len(observed_critical) == 0:
-        raise ValueError("No data returned for the specified date range.")
-
-    # 4. Perform Least Squares Fitting
-    print(f"Optimizing beta AND initial seed percentage using {args.how}...")
-    
-    # Passing dynamic parameters: [Initial Beta, Initial Seed Percentage Guess]
-    initial_guesses = [0.5, 0.001] 
-    
-    # Boundaries: Beta in [0.001, 5.0], Seed fraction in [0.001%, 5%]
-    bounds = [(1e-3, 5.0), (1e-5, 0.05)] 
-
-    result = minimize(
-        objective_function,
-        initial_guesses,
-        args=(t, observed_critical, model_params, args.wave),
-        method='L-BFGS-B',
-        bounds=bounds
-    )
-
-    best_beta = result.x[0]
-    best_seed_percentage = result.x[1]
-
-    # Calculate final calibrated initial counts for terminal reporting
-    final_y0_flat = build_y0(best_seed_percentage, args.wave)
-    final_y0_matrix = final_y0_flat.reshape(3, 6)
-
-    print("\n--- Fitting Results ---")
-    print(f"Success: {result.success}")
-    print(f"Optimized Transmission Rate (beta): {best_beta:.4f}")
-    print(f"Optimized Initial Seed Fraction: {best_seed_percentage * 100:.4f}%")
-    print(f"Final Loss (RSS): {result.fun:.2f}")
-
-    print("\n--- Optimized Initial Headcounts (t=0) ---")
-    age_labels = ["0-20 (Young)", "21-64 (Middle)", "65+ (Elderly)"]
-    for i in range(3):
-        print(f"{age_labels[i]}: S={final_y0_matrix[i,0]:.0f}, E={final_y0_matrix[i,1]:.0f}, I={final_y0_matrix[i,2]:.0f}")
-
-    # 5. Generate Fitted Model Curves for Plotting
-    fitted_solution = run_model(final_y0_flat, t, best_beta, model_params)
-    fitted_hospitalized = np.sum(fitted_solution.reshape(len(t), 3, 6)[:, :, 3], axis=1)
-
-    # 6. Plotting
-    plt.figure(figsize=(12, 6))
-    plt.plot(dates, observed_critical, 'ro', label='Observed Critical Data', alpha=0.6, markersize=4)
-    plt.plot(dates, fitted_hospitalized, 'b-', label=f'Fitted Model ($\\beta$={best_beta:.2f}, Seed={best_seed_percentage*100:.3f}%)', linewidth=2)
-    
-    plt.title(f"SEIHDR Joint Parameter Calibration - {wave_title}")
-    plt.xlabel("Date")
-    plt.ylabel("Total Critical Hospitalizations")
-    plt.grid(True, linestyle='--', alpha=0.5)
-    plt.legend()
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-
-    # Dynamic image saving and timestamped history isolation
-    plots_dir = Path(__file__).parent / 'fitted_plots'
+    plots_dir = Path(__file__).parent / "fitted_plots"
     plots_dir.mkdir(exist_ok=True)
-    
-    archive_old_fitted_plots(plots_dir)
-    plt.savefig(plots_dir / f"fitting_wave_{args.wave}.png")
-    print(f"Saved fresh plot to {plots_dir / f'fitting_wave_{args.wave}.png'}")
-    
-    plt.show()
+    splineplots_dir = Path(__file__).parent / "fitted_plots_splines"
+    splineplots_dir.mkdir(exist_ok=True)
 
-if __name__ == '__main__':
+    for start_date in start_dates:
+        print(f"Loading HK Gov data for {wave_title} from {start_date}...")
+        dates, observed_critical = load_hkgov_critical_series(start_date=start_date, end_date=end_date)
+        t = np.arange(len(dates))
+
+        if len(observed_critical) == 0:
+            print(f"Skipping {start_date}: no data returned.")
+            continue
+
+        use_splines = args.splines == "y"
+        knot_times = get_knot_times(t, n_knots=3) if use_splines else None
+        weights = build_weights(np.array(dates, dtype="datetime64[D]"), args.wave)
+
+        print(f"Optimizing {'3-knot quadratic splines' if use_splines else 'constant beta'} + seed percentage...")
+
+        result = fit_with_multistart(
+            t=t,
+            observed_critical=observed_critical,
+            model_params=model_params,
+            wave=args.wave,
+            use_splines=use_splines,
+            knot_times=knot_times,
+            weights=weights,
+        )
+
+        best_seed = result.x[0]
+
+        if use_splines:
+            best_beta_knots = result.x[1:]
+            print(f"Optimized beta at 3 knots: {best_beta_knots.round(4)}")
+            # Evaluation uses quadratic spline degree k=2
+            beta_func = make_interp_spline(knot_times, best_beta_knots, k=2)
+            beta_t = beta_func(t)
+            fitted_solution = run_model(build_y0(best_seed, args.wave), t, beta_t, model_params)
+        else:
+            best_beta = result.x[1]
+            fitted_solution = run_model(build_y0(best_seed, args.wave), t, best_beta, model_params)
+
+        fitted_hospitalized = np.sum(fitted_solution.reshape(len(t), 3, 6)[:, :, 3], axis=1)
+
+        print("\n--- Fitting Results ---")
+        print(f"Start Date: {start_date}")
+        print(f"Success: {result.success}")
+        print(f"Optimized Initial Seed Fraction: {best_seed * 100:.6f}%")
+        print(f"Final Loss (Weighted RSS): {result.fun:.2f}")
+
+        n_params = len(result.x)
+        n = len(observed_critical)
+        aic = n * np.log(result.fun / n) + 2 * n_params if n > 0 and result.fun > 0 else float("inf")
+        print(f"Approx AIC: {aic:.2f} (params={n_params})")
+
+        plt.figure(figsize=(12, 6))
+        plt.plot(dates, observed_critical, "ro", label="Observed Critical Data", alpha=0.6, markersize=4)
+        if use_splines:
+            label = f"Fitted (3-knot quadratic spline, Seed={best_seed*100:.3f}%)"
+        else:
+            label = f"Fitted Model ($\\beta$={best_beta:.2f}, Seed={best_seed*100:.3f}%)"
+        plt.plot(dates, fitted_hospitalized, "b-", label=label, linewidth=2)
+
+        plt.title(f"SEIHDR Calibration - {wave_title} ({start_date} to {end_date})")
+        plt.xlabel("Date")
+        plt.ylabel("Total Critical Hospitalizations")
+        plt.grid(True, linestyle="--", alpha=0.5)
+        plt.legend()
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+
+        suffix = "_splines_quad3" if use_splines else ""
+        if use_splines:
+            save_path = splineplots_dir / f"fitting_wave_{args.wave}_{start_date}{suffix}.png"
+        else:
+            save_path = plots_dir / f"fitting_wave_{args.wave}_{start_date}{suffix}.png"
+
+        plt.savefig(save_path, dpi=200)
+        print(f"Saved plot to {save_path}\n")
+        plt.show()
+        plt.close()
+
+
+if __name__ == "__main__":
     main()
