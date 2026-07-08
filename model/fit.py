@@ -165,10 +165,10 @@ def main(argv=None):
         wave_title = "Wave 4 (Ancestral)"
         start_dates = ["2020-10-15", "2020-11-01", "2020-11-15", "2020-12-01"]
     else:
-        end_date = "2022-06-01"
+        end_date = "2022-05-10"
         model_params = OMICRON_PARAMS
         wave_title = "Wave 5 (Omicron)"
-        start_dates = ["2022-01-01", "2022-01-15", "2022-02-01", "2022-02-15"]
+        start_dates = ["2022-01-15", "2022-02-01", "2022-02-15"]
 
     plots_dir = Path(__file__).parent / "fitted_plots"
     plots_dir.mkdir(exist_ok=True)
