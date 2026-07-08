@@ -22,24 +22,43 @@ from data.plot import load_hkgov_critical_series
 
 
 # ==============================================================================
-# CONFIG
+# CONFIG & CALIBRATION BOUNDS
 # ==============================================================================
-WEIGHTED_START = np.datetime64("2022-01-01")
-WEIGHTED_END = np.datetime64("2022-02-01")
+WEIGHTED_START = np.datetime64("2022-02-01")
+WEIGHTED_END = np.datetime64("2022-03-01")
 WEIGHT_MULTIPLIER = 0.3
 
-BETA_MIN = 0.2
-BETA_MAX = 1.2  # Tightened upper bound to prevent explosive wave 4 growth
-BETA_ROUGHNESS_WEIGHT = 5000.0  # Slightly increased to support smoothing
+BETA_MIN = 0.001
+BETA_MAX = 5.0                  
+BETA_ROUGHNESS_WEIGHT = 1000.0  
 BETA_BOUNDARY_PENALTY = 1e5
 
-SEED_BOUNDS = (1e-6, 0.02)
-CONSTANT_BETA_BOUNDS = (0.05, 2.5)
-SPLINE_BETA_BOUNDS = (0.1, 1.2)  # Tightened spline search space upper bound
+# Co-optimization search space boundaries
+SEED_BOUNDS = (1e-5, 0.05)       
+CONSTANT_BETA_BOUNDS = (0.001, 5.0)
+SPLINE_BETA_BOUNDS = (0.001, 5.0) 
 
 
-def get_knot_times(t, n_knots=3):  # Restricted exclusively to 3 knots
-    return np.linspace(0, len(t) - 1, n_knots, dtype=int)
+def calculate_r0(beta_array, static_params):
+    # Assuming typical SEIR progression: R0 = beta * infectious_duration
+    infectious_period = 4.5  
+    return beta_array * infectious_period
+
+
+def get_knot_times(t, observed_critical, n_knots=3):
+    if n_knots == 3:
+        cum_data = np.cumsum(observed_critical)
+        if cum_data[-1] == 0:
+            return np.linspace(0, len(t) - 1, n_knots, dtype=int)
+        
+        mid_idx = np.searchsorted(cum_data, cum_data[-1] * 0.5)
+        knots = [0, int(mid_idx), len(t) - 1]
+        
+        if knots[1] == knots[0]:
+            knots[1] = len(t) // 2
+        return np.array(knots)
+    else:
+        return np.linspace(0, len(t) - 1, n_knots, dtype=int)
 
 
 def build_y0(seed_percentage, wave):
@@ -87,28 +106,22 @@ def objective_function(
     use_splines=False,
     knot_times=None,
     weights=None,
+    how="rss-rough",
 ):
     seed_percentage = params_to_fit[0]
 
     if use_splines and knot_times is not None:
         beta_knots = params_to_fit[1:]
-        # Changed degree k=3 (cubic) to k=2 (quadratic spline)
-        beta_func = make_interp_spline(knot_times, beta_knots, k=2)
+        beta_func = make_interp_spline(knot_times, beta_knots, k=1)
         beta_eval = beta_func(t)
-
-        # Penalize the entire evaluated timeline array instead of just sparse knots
-        boundary_penalty = 0.0
-        boundary_penalty += max(0.0, BETA_MIN - np.min(beta_eval)) ** 2
-        boundary_penalty += max(0.0, np.max(beta_eval) - BETA_MAX) ** 2
-        boundary_penalty *= BETA_BOUNDARY_PENALTY
     else:
-        beta = params_to_fit[1] if len(params_to_fit) > 1 else params_to_fit[0]
-        beta_eval = beta
+        beta = params_to_fit[1]
+        beta_eval = np.full(len(t), beta)
 
-        boundary_penalty = 0.0
-        boundary_penalty += max(0.0, BETA_MIN - beta) ** 2
-        boundary_penalty += max(0.0, beta - BETA_MAX) ** 2
-        boundary_penalty *= BETA_BOUNDARY_PENALTY
+    boundary_penalty = 0.0
+    boundary_penalty += max(0.0, BETA_MIN - np.min(beta_eval)) ** 2
+    boundary_penalty += max(0.0, np.max(beta_eval) - BETA_MAX) ** 2
+    boundary_penalty *= BETA_BOUNDARY_PENALTY
 
     y0 = build_y0(seed_percentage, wave)
     y_hat = run_model(y0, t, beta_eval, static_params)
@@ -116,60 +129,32 @@ def objective_function(
     model_total_critical = np.sum(state_reshaped[:, :, 3], axis=1)
 
     resid = observed_critical - model_total_critical
+    if weights is not None:
+        resid = weights * resid
 
-    if weights is None:
-        loss = np.sum(resid ** 2)
-    else:
-        loss = np.sum(weights * resid ** 2)
-
+    loss = np.sum(resid ** 2)
+        
     if use_splines:
-        roughness = np.sum(np.diff(beta_knots, n=2) ** 2)
-        loss += BETA_ROUGHNESS_WEIGHT * roughness
+        if how == "rss-rough":
+            # Smooths out abrupt slope changes
+            roughness = np.mean(np.diff(beta_eval, n=1) ** 2)
+            loss += BETA_ROUGHNESS_WEIGHT * roughness
+            
+        # DEFENSE FIX: Epidemic End Anchor
+        # If the curve goes up at the very end when data is low, penalize it heavily.
+        # We check if the final knot value is greater than the middle knot value.
+        if len(beta_knots) == 3:
+            final_slope = beta_knots[2] - beta_knots[1]
+            if final_slope > 0:
+                # Severe penalty for an uncharacteristic late-wave explosion
+                loss += 5e4 * (final_slope ** 2)
 
     return loss + boundary_penalty
 
 
-def fit_with_multistart(
-    t,
-    observed_critical,
-    model_params,
-    wave,
-    use_splines,
-    knot_times,
-    weights,
-):
-    seed_grid = np.logspace(np.log10(SEED_BOUNDS[0]), np.log10(SEED_BOUNDS[1]), 10)
-
-    if use_splines:
-        base_beta = 0.6
-        # Initializing parameters specifically for 3 knots (1 seed parameter + 3 beta knots)
-        x0_list = [[seed0] + [base_beta] * 3 for seed0 in seed_grid]
-        bounds = [SEED_BOUNDS] + [SPLINE_BETA_BOUNDS] * 3
-    else:
-        x0_list = [[seed0, 0.5] for seed0 in seed_grid]
-        bounds = [SEED_BOUNDS, CONSTANT_BETA_BOUNDS]
-
-    best_result = None
-
-    for x0 in x0_list:
-        result = minimize(
-            objective_function,
-            x0,
-            args=(t, observed_critical, model_params, wave, use_splines, knot_times, weights),
-            method="L-BFGS-B",
-            bounds=bounds,
-            options={"maxiter": 500, "ftol": 1e-9}
-        )
-
-        if best_result is None or result.fun < best_result.fun:
-            best_result = result
-
-    return best_result
-
-
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Parameter fitting with weighted wave 5 data.")
-    parser.add_argument("--how", choices=["least_squares"], default="least_squares")
+    parser = argparse.ArgumentParser(description="Parameter fitting with joint optimization loops.")
+    parser.add_argument("--how", choices=["rss", "rss-rough"], default="rss-rough")
     parser.add_argument("--wave", choices=["4", "5"], default="4")
     parser.add_argument("--splines", choices=["y", "n"], default="n")
     args = parser.parse_args(argv)
@@ -200,71 +185,92 @@ def main(argv=None):
             continue
 
         use_splines = args.splines == "y"
-        knot_times = get_knot_times(t, n_knots=3) if use_splines else None
+        knot_times = get_knot_times(t, observed_critical, n_knots=3) if use_splines else None
         weights = build_weights(np.array(dates, dtype="datetime64[D]"), args.wave)
 
-        print(f"Optimizing {'3-knot quadratic splines' if use_splines else 'constant beta'} + seed percentage...")
+        print(f"Co-optimizing transmission vector AND initial seed percentage together...")
 
-        result = fit_with_multistart(
-            t=t,
-            observed_critical=observed_critical,
-            model_params=model_params,
-            wave=args.wave,
-            use_splines=use_splines,
-            knot_times=knot_times,
-            weights=weights,
+        initial_seed_guess = 0.001
+        initial_beta_guess = 0.5
+
+        if use_splines:
+            x0 = [initial_seed_guess] + [initial_beta_guess] * 3
+            bounds = [SEED_BOUNDS] + [SPLINE_BETA_BOUNDS] * 3
+        else:
+            x0 = [initial_seed_guess, initial_beta_guess]
+            bounds = [SEED_BOUNDS, CONSTANT_BETA_BOUNDS]
+
+        result = minimize(
+            objective_function,
+            x0,
+            args=(t, observed_critical, model_params, args.wave, use_splines, knot_times, weights, args.how),
+            method="L-BFGS-B",
+            bounds=bounds,
+            options={"maxiter": 400, "ftol": 1e-7}
         )
 
         best_seed = result.x[0]
 
         if use_splines:
             best_beta_knots = result.x[1:]
-            print(f"Optimized beta at 3 knots: {best_beta_knots.round(4)}")
-            # Evaluation uses quadratic spline degree k=2
-            beta_func = make_interp_spline(knot_times, best_beta_knots, k=2)
+            print(f"Optimized beta at adaptive knots: {best_beta_knots.round(4)}")
+            # LINEAR SPLINE EVALUATION (k=1)
+            beta_func = make_interp_spline(knot_times, best_beta_knots, k=1)
             beta_t = beta_func(t)
             fitted_solution = run_model(build_y0(best_seed, args.wave), t, beta_t, model_params)
+            r0_trajectory = calculate_r0(beta_t, model_params)
         else:
             best_beta = result.x[1]
             fitted_solution = run_model(build_y0(best_seed, args.wave), t, best_beta, model_params)
+            r0_trajectory = calculate_r0(np.full(len(t), best_beta), model_params)
 
         fitted_hospitalized = np.sum(fitted_solution.reshape(len(t), 3, 6)[:, :, 3], axis=1)
 
-        print("\n--- Fitting Results ---")
-        print(f"Start Date: {start_date}")
-        print(f"Success: {result.success}")
-        print(f"Optimized Initial Seed Fraction: {best_seed * 100:.6f}%")
-        print(f"Final Loss (Weighted RSS): {result.fun:.2f}")
+        print("\n--- Calibration Outputs ---")
+        print(f"Success Status: {result.success}")
+        print(f"Joint Seed Fraction Output: {best_seed * 100:.6f}%")
+        print(f"Mean R0 Value across timeline: {np.mean(r0_trajectory):.2f}")
+        print(f"Final Objective Function Loss Value: {result.fun:.2f}")
 
-        n_params = len(result.x)
-        n = len(observed_critical)
-        aic = n * np.log(result.fun / n) + 2 * n_params if n > 0 and result.fun > 0 else float("inf")
-        print(f"Approx AIC: {aic:.2f} (params={n_params})")
+        fig, ax1 = plt.subplots(figsize=(12, 6))
 
-        plt.figure(figsize=(12, 6))
-        plt.plot(dates, observed_critical, "ro", label="Observed Critical Data", alpha=0.6, markersize=4)
+        color = 'tab:red'
+        ax1.set_xlabel('Date')
+        ax1.set_ylabel('Total Critical Hospitalizations', color=color)
+        ax1.plot(dates, observed_critical, "ro", label="Observed Critical Data", alpha=0.5, markersize=4)
+        
         if use_splines:
-            label = f"Fitted (3-knot quadratic spline, Seed={best_seed*100:.3f}%)"
+            case_label = f"Fitted Model (3-Knot Linear Splines, Seed={best_seed*100:.4f}%)"
         else:
-            label = f"Fitted Model ($\\beta$={best_beta:.2f}, Seed={best_seed*100:.3f}%)"
-        plt.plot(dates, fitted_hospitalized, "b-", label=label, linewidth=2)
+            case_label = f"Fitted Model (Constant, $\\beta$={best_beta:.2f}, Seed={best_seed*100:.4f}%)"
+            
+        ax1.plot(dates, fitted_hospitalized, "b-", label=case_label, linewidth=2)
+        ax1.tick_params(axis='y', labelcolor=color)
+        ax1.grid(True, linestyle="--", alpha=0.3)
 
-        plt.title(f"SEIHDR Calibration - {wave_title} ({start_date} to {end_date})")
-        plt.xlabel("Date")
-        plt.ylabel("Total Critical Hospitalizations")
-        plt.grid(True, linestyle="--", alpha=0.5)
-        plt.legend()
+        ax2 = ax1.twinx()  
+        color = 'tab:green'
+        ax2.set_ylabel('Calculated Reproduction Metric (R0)', color=color)
+        ax2.plot(dates, r0_trajectory, 'g--', label=f'R0 Trajectory (Mean={np.mean(r0_trajectory):.2f})', linewidth=1.5)
+        ax2.tick_params(axis='y', labelcolor=color)
+
+        plt.title(f"Joint SEIHDR Calibration with R0 Output - {wave_title} ({start_date})")
+        fig.tight_layout()
+        
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+
         plt.xticks(rotation=45)
-        plt.tight_layout()
 
-        suffix = "_splines_quad3" if use_splines else ""
+        suffix = f"_{args.how}_joint_linear_splines" if use_splines else f"_{args.how}_joint_constant"
         if use_splines:
             save_path = splineplots_dir / f"fitting_wave_{args.wave}_{start_date}{suffix}.png"
         else:
             save_path = plots_dir / f"fitting_wave_{args.wave}_{start_date}{suffix}.png"
 
         plt.savefig(save_path, dpi=200)
-        print(f"Saved plot to {save_path}\n")
+        print(f"Saved execution graph to {save_path}\n")
         plt.show()
         plt.close()
 
