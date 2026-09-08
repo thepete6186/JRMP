@@ -1,7 +1,8 @@
-# This script aggregates the original 15x15 age-contact matrix into 3 main age groups.
-import numpy as np
-import shutil
+"""Aggregation of a 15x15 age-contact matrix into three broad age groups."""
 
+import numpy as np
+
+# Source (15 age bands) contact matrix from Prem et al., contactmatrix paper.
 original_matrix = np.array([
     [3.11, 0.51, 0.14, 0.07, 0.67, 0.86, 1.58, 0.85, 0.71, 0.21, 0.34, 0.50, 0.46, 0.13, 0.05],
     [0.43, 3.50, 0.77, 0.27, 0.22, 0.48, 0.86, 0.90, 0.98, 0.48, 0.15, 0.06, 0.22, 0.17, 0.27],
@@ -17,34 +18,24 @@ original_matrix = np.array([
     [0.47, 0.06, 0.08, 0.16, 0.41, 0.51, 0.66, 0.63, 0.82, 0.70, 1.18, 0.73, 0.65, 0.41, 0.31],
     [0.10, 0.03, 0.04, 0.04, 0.23, 0.36, 0.40, 0.38, 0.30, 0.42, 0.51, 0.80, 0.61, 0.35, 0.18],
     [0.21, 0.00, 0.09, 0.05, 0.23, 0.34, 0.41, 0.51, 0.57, 0.19, 0.32, 0.39, 0.67, 0.26, 0.18],
-    [0.03, 0.02, 0.00, 0.22, 0.16, 0.31, 0.38, 0.54, 0.54, 0.26, 0.19, 0.33, 0.55, 0.44, 0.66]
+    [0.03, 0.02, 0.00, 0.22, 0.16, 0.31, 0.38, 0.54, 0.54, 0.26, 0.19, 0.33, 0.55, 0.44, 0.66],
 ], dtype=float)
-#Original matrix from the paper 
 
-populationcount = [213.1, 270.9, 290.1, 268.8, 302.9, 436.1, 512.2, 561.0, 584.7, 566.6, 576.8, 605.9, 628.1, 523.5, 395.0+221.1+159.3+230.0]
+# Population counts (in millions) for the same 15 age bands. The final band
+# groups everyone 85+.
+population_count = [
+    213.1, 270.9, 290.1, 268.8, 302.9, 436.1, 512.2, 561.0, 584.7,
+    566.6, 576.8, 605.9, 628.1, 523.5, 395.0 + 221.1 + 159.3 + 230.0,
+]
 
 
 def aggregate_contact_matrix(matrix, population, groups):
     """
-    Aggregate an age-specific contact matrix into larger age groups.
+    Aggregate a contact matrix over source and target age groups.
 
-    The aggregation is asymmetric: for each source group, contacts to all
-    destination ages in the target group are summed, then averaged across the
+    For each coarse source group, contacts into each coarse target group are
+    summed across the fine destination ages and then averaged across the fine
     source ages using population weights.
-
-    Parameters
-    ----------
-    matrix : np.ndarray
-        Square contact matrix for the fine age groups.
-    population : array-like
-        Population counts for each fine age group.
-    groups : list[list[int]]
-        Indices for the fine age groups that belong to each coarse group.
-
-    Returns
-    -------
-    np.ndarray
-        Aggregated contact matrix.
     """
     matrix = np.asarray(matrix, dtype=float)
     population = np.asarray(population, dtype=float)
@@ -66,21 +57,15 @@ age_groups_3 = [
     list(range(13, 15)), # 65+
 ]
 
-
-if __name__ == "__main__":
-    population_array = np.asarray(populationcount, dtype=float)
-    contact_3x3 = aggregate_contact_matrix(original_matrix, population_array, age_groups_3)
-
-    np.set_printoptions(precision=4, suppress=True)
-    print("3x3 aggregated contact matrix (0-20, 21-64, 65+):")
-    print(contact_3x3)
-
-
 final_matrix = np.array([[4.8821, 4.998, 0.2838],
                          [0.8814, 5.9716, 0.3371],
                          [0.2974, 3.3867, 0.874]], dtype=float)
 
 
-
-
-
+if __name__ == "__main__":
+    contact_3x3 = aggregate_contact_matrix(original_matrix,
+                                          np.asarray(population_count),
+                                          age_groups_3)
+    np.set_printoptions(precision=4, suppress=True)
+    print("3x3 aggregated contact matrix (0-20, 21-64, 65+):")
+    print(contact_3x3)

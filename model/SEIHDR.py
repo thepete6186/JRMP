@@ -1,27 +1,29 @@
 import numpy as np
 from scipy.integrate import odeint
 
-from matrixgenerator import final_matrix, populationcount
+from matrixgenerator import final_matrix, population_count
 
 AGE_GROUPS = ("0-20", "21-64", "65+")
 CONTACT_MATRIX = final_matrix
 AGE_GROUP_SLICES = (slice(0, 4), slice(4, 13), slice(13, 15))
 
 DEFAULT_POPULATION = np.array(
-    [sum(populationcount[s]) for s in AGE_GROUP_SLICES],
+    [sum(population_count[s]) for s in AGE_GROUP_SLICES],
     dtype=float,
 )
 
+# Omicron variant (wave 5) parameters.
 OMICRON_PARAMS = {
     "sigma": np.array([1/4, 1/4, 1/4], dtype=float),
     "tau1": np.array([1/6, 1/6, 1/6], dtype=float),
-    "delta1": np.array([0.0, 0.0, 0.0], dtype=float),  
+    "delta1": np.array([0.0, 0.0, 0.0], dtype=float),
     "tau2": np.array([0.152, 0.124, 0.091], dtype=float),
     "delta2": np.array([0.00154, 0.0299, 0.063], dtype=float),
     "alpha": np.array([0.0029, 0.0043, 0.012], dtype=float),
     "upsilon": np.array([1/160, 1/160, 1/160], dtype=float),
 }
 
+# Ancestral strain (wave 4) parameters.
 ANCESTRAL_PARAMS = {
     "sigma": np.array([1/5.5, 1/5.5, 1/5.5], dtype=float),
     "tau1": np.array([1/6, 1/6, 1/6], dtype=float),
@@ -35,7 +37,7 @@ ANCESTRAL_PARAMS = {
 def SEIHDR_model(
     y,
     t,
-    beta,  # Can be a float, a callable function, or an array matching the time grid
+    beta,  # float, callable, or array matching the time grid
     sigma,
     tau1,
     tau2,
@@ -45,12 +47,9 @@ def SEIHDR_model(
     upsilon,
     contact_matrix=CONTACT_MATRIX,
     population=None,
-    t_grid=None, # Required if beta is a pre-computed array
+    t_grid=None,  # required when beta is a pre-computed array
 ):
-    """
-    Age-stratified SEIHDR model supporting functional, constant, or array-based beta values.
-    """
-    # reshape state
+    """Age-stratified SEIHDR model with constant, functional, or array beta."""
     state = np.asarray(y, dtype=float).reshape(len(AGE_GROUPS), 6)
 
     susceptible = state[:, 0]
@@ -74,7 +73,6 @@ def SEIHDR_model(
     else:
         current_beta = beta
 
-    # Force arrays to prevent broadcasting bugs
     sigma = np.asarray(sigma)
     tau1 = np.asarray(tau1)
     tau2 = np.asarray(tau2)
@@ -84,7 +82,7 @@ def SEIHDR_model(
     upsilon = np.asarray(upsilon)
 
     infectious_fraction = np.divide(
-        infected + 0.1 * hospitalized,  
+        infected + 0.1 * hospitalized,
         population,
         out=np.zeros_like(infected, dtype=float),
         where=population > 0,
@@ -104,9 +102,7 @@ def SEIHDR_model(
 
 
 def run_model(y0, t, beta, params):
-    """
-    Executes the model simulation pass.
-    """
+    """Run the model over time grid t from initial state y0."""
     return odeint(
         SEIHDR_model,
         y0,
@@ -122,6 +118,6 @@ def run_model(y0, t, beta, params):
             params["upsilon"],
             CONTACT_MATRIX,
             DEFAULT_POPULATION,
-            t, # Passed down as t_grid in case beta is an array
+            t,
         ),
     )
